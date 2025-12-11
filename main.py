@@ -282,6 +282,22 @@ async def all_bookings():
         bookings.append(Booking(**item))
 
     return bookings
+@app.get("/room-types/{room_type_name}/image")
+async def get_room_image(room_type_name: str):
+    """
+    Return the image URL of a room type by name (case-insensitive match)
+    """
+    room = await room_types_collection.find_one({
+        "name": {"$regex": f"^{room_type_name}$", "$options": "i"}
+    })
+
+    if not room:
+        raise HTTPException(status_code=404, detail="Room type not found")
+
+    return {
+        "name": room["name"],
+        "image_url": room.get("image_url", "")
+    }
 
 
 @app.delete("/bookings/{booking_id}")
@@ -350,6 +366,31 @@ async def create_room_type(room_data: RoomType):
     await room_types_collection.insert_one(room_data.model_dump())
 
     return room_data
+
+
+@app.put("/room-types/{room_type_id}", response_model=RoomType)
+async def update_room_type(room_type_id: int, updated: RoomType):
+    existing = await room_types_collection.find_one({"id": room_type_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Room type not found")
+
+    await room_types_collection.update_one(
+        {"id": room_type_id},
+        {"$set": updated.model_dump()}
+    )
+
+    return updated
+
+@app.delete("/room-types/{room_type_id}")
+async def delete_room_type(room_type_id: int):
+    existing = await room_types_collection.find_one({"id": room_type_id})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Room type not found")
+
+    await room_types_collection.delete_one({"id": room_type_id})
+
+    return {"message": "Room type deleted successfully"}
+
 
 
 def main():

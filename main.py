@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field,EmailStr
 from typing import List, Optional
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -95,7 +95,7 @@ class BookingRequest(BaseModel):
     check_in_date: str
     check_out_date: str
     user_name: str
-    email: str
+    email: EmailStr
 
 
 class Booking(BaseModel):
@@ -105,6 +105,7 @@ class Booking(BaseModel):
     room_no: int
     check_in_date: str
     check_out_date: str
+    total_price: float
     stay_days: int
     user_name: str
     email: str
@@ -252,6 +253,10 @@ async def make_booking(data: BookingRequest):
     last = await bookings_collection.find_one(sort=[("booking_id", -1)])
     new_id = 1 if not last else last["booking_id"] + 1
 
+    # ✅ CALCULATE TOTAL PRICE
+    night_price = room_data["pricing"]["total_price"]
+    total_price = night_price * stay_days
+
     record = {
         "booking_id": new_id,
         "room_type_id": room_data["id"],
@@ -263,7 +268,8 @@ async def make_booking(data: BookingRequest):
         "user_name": data.user_name,
         "email": data.email,
         "status": "confirmed",
-        "created_at": datetime.utcnow().isoformat()
+        "created_at": datetime.utcnow().isoformat(),
+        "total_price": total_price   # ✅ STORE TOTAL PRICE
     }
 
     await bookings_collection.insert_one(record)

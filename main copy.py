@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Body, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
-from pydantic import BaseModel, Field, EmailStr
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -95,9 +95,7 @@ class BookingRequest(BaseModel):
     check_in_date: str
     check_out_date: str
     user_name: str
-    email: EmailStr
-    adults: int
-    children: int
+    email: str
 
 
 class Booking(BaseModel):
@@ -107,14 +105,13 @@ class Booking(BaseModel):
     room_no: int
     check_in_date: str
     check_out_date: str
-    total_price: float
     stay_days: int
+    total_price: float       # <-- ADD THIS BACK
     user_name: str
     email: str
-    adults: int
-    children: int
     status: str
     created_at: str
+
 
 
 class BookingResponse(BaseModel):
@@ -133,72 +130,21 @@ async def start_db():
 @app.on_event("shutdown")
 async def stop_db():
     client.close()
-    print("Database connection closed")
 
 
-# ==================== UTIL FUNCTIONS ====================
-def parse_date(date_str: str) -> datetime:
+
+
+
+# ==================== UTILS ====================
+def parse_date(date_str: str):
     try:
         return datetime.strptime(date_str, "%Y-%m-%d")
-    except Exception:
+    except:
         raise HTTPException(status_code=400, detail="Invalid date format, use YYYY-MM-DD")
 
 
-async def is_room_type_available(
-    room_data,
-    checkin_dt: datetime,
-    checkout_dt: datetime,
-    adults: int,
-    children: int,
-) -> bool:
-    """
-    Returns True only if:
-      - adults/children fit capacity
-      - at least one room_no is free for the date range
-    """
-
-    # Basic validation
-    if adults <= 0:
-        return False
-    if children < 0:
-        return False
-
-    # Capacity checks
-    if adults > room_data["capacity"]["adults"]:
-        return False
-    if children > room_data["capacity"]["children"]:
-        return False
-
-    # Date availability: check any room_no in this room_type is free
-    for rn in room_data.get("room_numbers", []):
-        room_no = rn["room_no"]
-        cursor = bookings_collection.find(
-            {
-                "room_no": room_no,
-                "status": "confirmed",
-            }
-        )
-
-        is_free = True
-        async for b in cursor:
-            try:
-                db_ci = datetime.strptime(b["check_in_date"], "%Y-%m-%d")
-                db_co = datetime.strptime(b["check_out_date"], "%Y-%m-%d")
-            except Exception:
-                continue
-
-            # overlap condition
-            if db_ci < checkout_dt and db_co > checkin_dt:
-                is_free = False
-                break
-
-        if is_free:
-            return True
-
-    return False
-
-
 # ==================== CRUD ROOM TYPES ====================
+
 
 
 @app.get("/room/{room_type_id}", response_model=RoomType)
@@ -206,6 +152,7 @@ async def get_room(room_type_id: int):
     data = await room_types_collection.find_one({"id": room_type_id})
     if not data:
         raise HTTPException(status_code=404, detail="Room Type Not Found")
+
     data.pop("_id", None)
     return RoomType(**data)
 
@@ -213,16 +160,80 @@ async def get_room(room_type_id: int):
 # ==================== SEARCH ROOM TYPES BY DATE ====================
 @app.get("/room-types/available", response_model=List[RoomType])
 async def available_rooms(
-    check_in_date: str = Query(..., description="Check-in date in YYYY-MM-DD format"),
-    check_out_date: str = Query(..., description="Check-out date in YYYY-MM-DD format"),
-    adults: int = Query(..., ge=1, description="Number of adults"),
-    children: int = Query(..., ge=0, description="Number of children"),
+    check_in_date: str,
+    check_out_date: str,
+    adults: Optional[int] = None,
+    children: Optional[int] = None,
 ):
-    # Parse & validate dates
     try:
         checkin_dt = datetime.strptime(check_in_date, "%Y-%m-%d")
         checkout_dt = datetime.strptime(check_out_date, "%Y-%m-%d")
-    except Exception:
+    except:
+        raise HTTPException(status_code=400, detail="Date must be in YYYY-MM-DD format")
+
+    if checkout_dt <= checkin_dt:
+        raise HTTPException(status_code=400, detail="check_out_date must be after check_in_date")
+
+    today = datetime.utcnow().date()
+    max_date = today + timedelta(days=30)
+
+    if checkin_dt.date() < today or checkout_dt.date() < today:
+        raise HTTPException(status_code=400, detail="Dates cannot be in the past")
+
+    if checkin_dt.date() > max_date or checkout_dt.date() > max_date:
+        raise HTTPException(status_code=400, detail="Dates cannot be more than 30 days ahead")
+
+    clean_rooms: List[RoomType] = []
+    cursor = room_types_collection.find()
+
+    async for room in cursor:
+        if adults is not None and room["capacity"]["adults"] < adults:
+            continue
+        if children is not None and room["capacity"]["children"] < children:
+            continue
+
+        available_room_numbers: List[RoomNumber] = []
+
+        for rn in room.get("room_numbers", []):
+            room_no = rn["room_no"]
+
+            # Fetch all confirmed bookings for that room
+            bookings_cursor = bookings_collection.find({
+                "room_no": room_no,
+                "status": "confirmed"
+            })
+
+            is_available = True
+
+            async for b in bookings_cursor:
+                # Convert stored date strings to datetime objects
+                db_checkin = datetime.strptime(b["check_in_date"], "%Y-%m-%d")
+                db_checkout = datetime.strptime(b["check_out_date"], "%Y-%m-%d")
+
+                # Overlap check in Python (correct comparison)
+                if db_checkin < checkout_dt and db_checkout > checkin_dt:
+                    is_available = False
+                    break
+
+            if is_available:
+                available_room_numbers.append(RoomNumber(room_no=room_no))
+
+        if available_room_numbers:
+            room.pop("_id", None)
+            room["room_numbers"] = [r.model_dump() for r in available_room_numbers]
+            clean_rooms.append(RoomType(**room))
+
+    return clean_rooms
+
+# ==================== BOOK ROOM ====================
+@app.post("/bookings", response_model=BookingResponse)
+async def make_booking(data: BookingRequest):
+
+    # Parse dates
+    try:
+        checkin_dt = datetime.strptime(data.check_in_date, "%Y-%m-%d")
+        checkout_dt = datetime.strptime(data.check_out_date, "%Y-%m-%d")
+    except:
         raise HTTPException(status_code=400, detail="Date must be in YYYY-MM-DD format")
 
     today = datetime.utcnow().date()
@@ -237,146 +248,64 @@ async def available_rooms(
     if checkout_dt <= checkin_dt:
         raise HTTPException(status_code=400, detail="check_out_date must be after check_in_date")
 
-    # Validate adults/children inputs
-    if adults <= 0:
-        raise HTTPException(status_code=400, detail="Adults must be at least 1")
-    if children < 0:
-        raise HTTPException(status_code=400, detail="Children count cannot be negative")
-
-    clean_rooms: List[RoomType] = []
-    cursor = room_types_collection.find()
-
-    async for room in cursor:
-        # Capacity filter
-        if room["capacity"]["adults"] < adults:
-            continue
-        if room["capacity"]["children"] < children:
-            continue
-
-        available_room_numbers: List[RoomNumber] = []
-
-        for rn in room.get("room_numbers", []):
-            room_no = rn["room_no"]
-
-            # Keep only room numbers with no overlap in date range
-            overlap = await bookings_collection.find_one(
-                {
-                    "room_no": room_no,
-                    "status": "confirmed",
-                    "check_in_date": {"$lt": check_out_date},
-                    "check_out_date": {"$gt": check_in_date},
-                }
-            )
-
-            if not overlap:
-                available_room_numbers.append(RoomNumber(room_no=room_no))
-
-        if available_room_numbers:
-            room.pop("_id", None)
-            room["room_numbers"] = [r.model_dump() for r in available_room_numbers]
-            clean_rooms.append(RoomType(**room))
-
-    return clean_rooms
-
-
-@app.post("/bookings", response_model=BookingResponse)
-async def make_booking(data: BookingRequest):
-    # Basic log
-    print("BOOKING REQUEST:", data.model_dump())
-
-    # Parse dates
-    try:
-        checkin_dt = parse_date(data.check_in_date)
-        checkout_dt = parse_date(data.check_out_date)
-    except HTTPException:
-        raise
-
-    today = datetime.utcnow().date()
-    max_date = today + timedelta(days=30)
-
-    if checkin_dt.date() < today or checkout_dt.date() < today:
-        raise HTTPException(status_code=400, detail="Dates cannot be in the past")
-    if checkin_dt.date() > max_date or checkout_dt.date() > max_date:
-        raise HTTPException(status_code=400, detail="Dates cannot be more than 30 days ahead")
-    if checkout_dt <= checkin_dt:
-        raise HTTPException(status_code=400, detail="check_out_date must be after check_in_date")
-
-    # Fetch room type once
     room_data = await room_types_collection.find_one({"id": data.room_type_id})
     if not room_data:
         raise HTTPException(status_code=404, detail="Room type not found")
 
     stay_days = (checkout_dt - checkin_dt).days
-    if stay_days < room_data.get("min_days", 1) or stay_days > room_data.get("max_days", 30):
+
+    if stay_days < room_data["min_days"] or stay_days > room_data["max_days"]:
         raise HTTPException(
             status_code=400,
-            detail=f"You must stay between {room_data.get('min_days',1)} - {room_data.get('max_days',30)} days"
+            detail=f"You must stay between {room_data['min_days']} - {room_data['max_days']} days"
         )
 
-    # Capacity validation
-    if data.adults > room_data["capacity"]["adults"]:
-        raise HTTPException(status_code=400, detail=f"Max adults allowed for this room: {room_data['capacity']['adults']}")
-    if data.children > room_data["capacity"]["children"]:
-        raise HTTPException(status_code=400, detail=f"Max children allowed for this room: {room_data['capacity']['children']}")
-
-    # Use is_room_type_available to check both capacity and date availability
-    available = await is_room_type_available(
-        room_data,
-        checkin_dt,
-        checkout_dt,
-        data.adults,
-        data.children,
-    )
-    if not available:
-        raise HTTPException(status_code=400, detail="This room type is not available for the selected dates or capacity")
-
-    # Select a free room_no
     selected_room = None
-    for rn in room_data.get("room_numbers", []):
+
+    for rn in room_data["room_numbers"]:
         room_no = rn["room_no"]
-        cursor = bookings_collection.find({
+
+        # Fetch all bookings for that room
+        bookings_cursor = bookings_collection.find({
             "room_no": room_no,
             "status": "confirmed"
         })
 
-        free = True
-        async for b in cursor:
-            try:
-                db_checkin = datetime.strptime(b["check_in_date"], "%Y-%m-%d")
-                db_checkout = datetime.strptime(b["check_out_date"], "%Y-%m-%d")
-            except Exception:
-                continue
+        is_available = True
 
+        async for b in bookings_cursor:
+            db_checkin = datetime.strptime(b["check_in_date"], "%Y-%m-%d")
+            db_checkout = datetime.strptime(b["check_out_date"], "%Y-%m-%d")
+
+            # Overlap check
             if db_checkin < checkout_dt and db_checkout > checkin_dt:
-                free = False
+                is_available = False
                 break
 
-        if free:
+        if is_available:
             selected_room = room_no
             break
 
     if not selected_room:
         raise HTTPException(status_code=400, detail="No rooms available")
 
-    # Create booking ID
     last = await bookings_collection.find_one(sort=[("booking_id", -1)])
     new_id = 1 if not last else last["booking_id"] + 1
 
     night_price = room_data["pricing"]["total_price"]
     total_price = night_price * stay_days
 
+    # Store as STRING (your requirement)
     record = {
         "booking_id": new_id,
         "room_type_id": room_data["id"],
         "room_name": room_data["name"],
         "room_no": selected_room,
-        "check_in_date": data.check_in_date,
-        "check_out_date": data.check_out_date,
+        "check_in_date": data.check_in_date,   # store string
+        "check_out_date": data.check_out_date, # store string
         "stay_days": stay_days,
         "user_name": data.user_name,
         "email": data.email,
-        "adults": data.adults,
-        "children": data.children,
         "status": "confirmed",
         "created_at": datetime.utcnow().isoformat(),
         "total_price": total_price
@@ -385,26 +314,19 @@ async def make_booking(data: BookingRequest):
     await bookings_collection.insert_one(record)
     record.pop("_id", None)
 
-    print("BOOKING CREATED:", record["booking_id"], "ROOM_NO:", selected_room)
     return {"message": "Room Booked Successfully!", "booking": Booking(**record)}
 
-@app.get("/bookings/email/{email}", response_model=List[Booking])
-async def get_bookings_by_email(email: str):
-    """
-    Get all bookings for a specific email address
-    """
 
+@app.get("/bookings", response_model=List[Booking])
+async def all_bookings():
     bookings = []
-    cursor = bookings_collection.find({"email": email})
+    cursor = bookings_collection.find()
+
     async for item in cursor:
         item.pop("_id", None)
         bookings.append(Booking(**item))
-    
-    if not bookings:
-        raise HTTPException(status_code=404, detail="No bookings found for this email")
-    
-    return bookings
 
+    return bookings
 @app.get("/room-types/{room_type_name}/image")
 async def get_room_image(room_type_name: str):
     """
@@ -413,9 +335,14 @@ async def get_room_image(room_type_name: str):
     room = await room_types_collection.find_one({
         "name": {"$regex": f"^{room_type_name}$", "$options": "i"}
     })
+
     if not room:
         raise HTTPException(status_code=404, detail="Room type not found")
-    return {"name": room["name"], "image_url": room.get("image_url", "")}
+
+    return {
+        "name": room["name"],
+        "image_url": room.get("image_url", "")
+    }
 
 
 @app.delete("/bookings/{booking_id}")
@@ -423,8 +350,12 @@ async def cancel_booking(booking_id: int):
     booking = await bookings_collection.find_one({"booking_id": booking_id})
     if not booking:
         raise HTTPException(status_code=404, detail="Booking not found")
-    await bookings_collection.update_one({"booking_id": booking_id}, {"$set": {"status": "cancelled"}})
-    print("BOOKING CANCELLED:", booking_id)
+
+    await bookings_collection.update_one(
+        {"booking_id": booking_id},
+        {"$set": {"status": "cancelled"}}
+    )
+
     return {"message": "Booking cancelled successfully"}
 
 
@@ -442,37 +373,43 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
     token = create_token(form_data.username)
     return {"access_token": token, "token_type": "bearer"}
 
-
 @app.post("/room-types", response_model=RoomType)
 async def add_room(room_data: RoomType):
     exists = await room_types_collection.find_one({"id": room_data.id})
     if exists:
         raise HTTPException(status_code=400, detail="Room ID already exists")
+
     await room_types_collection.insert_one(room_data.model_dump())
     return room_data
-
 
 @app.get("/")
 def root():
     return {"message": "Hotel Booking API Running 🏨"}
 
-
 @app.get("/room-types", response_model=List[RoomType])
 async def get_all_room_types():
     rooms = []
     cursor = room_types_collection.find()
+
     async for doc in cursor:
         doc.pop("_id", None)
         rooms.append(RoomType(**doc))
-    return rooms
 
+    return rooms
 
 @app.post("/room-types", response_model=RoomType)
 async def create_room_type(room_data: RoomType):
+    """
+    Create a new room type along with room numbers and pricing.
+    """
+    # Check if room type already exists
     existing = await room_types_collection.find_one({"id": room_data.id})
     if existing:
         raise HTTPException(status_code=400, detail="Room type with this ID already exists")
+
+    # Insert into database
     await room_types_collection.insert_one(room_data.model_dump())
+
     return room_data
 
 
@@ -481,26 +418,25 @@ async def update_room_type(room_type_id: int, updated: RoomType):
     existing = await room_types_collection.find_one({"id": room_type_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Room type not found")
-    await room_types_collection.update_one({"id": room_type_id}, {"$set": updated.model_dump()})
-    return updated
 
+    await room_types_collection.update_one(
+        {"id": room_type_id},
+        {"$set": updated.model_dump()}
+    )
+
+    return updated
 
 @app.delete("/room-types/{room_type_id}")
 async def delete_room_type(room_type_id: int):
     existing = await room_types_collection.find_one({"id": room_type_id})
     if not existing:
         raise HTTPException(status_code=404, detail="Room type not found")
+
     await room_types_collection.delete_one({"id": room_type_id})
+
     return {"message": "Room type deleted successfully"}
 
-@app.get("/bookings", response_model=List[Booking])
-async def all_bookings():
-    bookings = []
-    cursor = bookings_collection.find()
-    async for item in cursor:
-        item.pop("_id", None)
-        bookings.append(Booking(**item))
-    return bookings
+
 
 def main():
     import uvicorn

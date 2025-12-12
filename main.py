@@ -9,6 +9,7 @@ from pymongo.server_api import ServerApi
 from dotenv import load_dotenv
 import os
 import jwt
+from passlib.context import CryptContext
 
 from fastapi_mcp import FastApiMCP
 
@@ -26,15 +27,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
 # ==================== JWT CONFIG ====================
 SECRET_KEY = "MY_SECRET_KEY"
 ALGORITHM = "HS256"
 
-DUMMY_USER = {
-    "username": "admin",
-    "password": "password123"
-}
+
 
 def create_token(username: str):
     expiration = datetime.utcnow() + timedelta(hours=5)
@@ -46,6 +51,9 @@ MONGO_URI = os.getenv("MONGO_URI")
 DATABASE_NAME = "denisons_beach_resort"
 ROOM_TYPES_COLLECTION = "RoomTypes"
 BOOKINGS_COLLECTION = "Bookings"
+ADMINS_COLLECTION = "Admins"
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
 if not MONGO_URI:
     raise ValueError("Missing MONGO_URI env variable")
@@ -55,6 +63,7 @@ db = client[DATABASE_NAME]
 
 room_types_collection = db[ROOM_TYPES_COLLECTION]
 bookings_collection = db[BOOKINGS_COLLECTION]
+admins_collection = db[ADMINS_COLLECTION]  # ✅ Now db exists
 
 
 # ==================== MODELS ====================
@@ -127,8 +136,20 @@ class BookingResponse(BaseModel):
 async def start_db():
     await room_types_collection.create_index("id", unique=True)
     await bookings_collection.create_index("booking_id", unique=True)
+    await admins_collection.create_index("username", unique=True)
+    
+    # Create default admin from env variables if not exists
+    existing_admin = await admins_collection.find_one({"username": ADMIN_USERNAME})
+    if not existing_admin:
+        default_admin = {
+            "username": ADMIN_USERNAME,
+            "password": hash_password(ADMIN_PASSWORD),
+            "created_at": datetime.utcnow().isoformat()
+        }
+        await admins_collection.insert_one(default_admin)
+        print(f"✅ Default admin created (username: {ADMIN_USERNAME})")
+    
     print("Database connected 🔥")
-
 
 @app.on_event("shutdown")
 async def stop_db():
@@ -188,7 +209,7 @@ async def is_room_type_available(
                 continue
 
             # overlap condition
-            if db_ci < checkout_dt and db_co > checkin_dt:
+            if db_ci < checkout_dt and db_co >= checkin_dt:
                 is_free = False
                 break
 
@@ -264,7 +285,7 @@ async def available_rooms(
                     "room_no": room_no,
                     "status": "confirmed",
                     "check_in_date": {"$lt": check_out_date},
-                    "check_out_date": {"$gt": check_in_date},
+                    "check_out_date": {"$gte": check_in_date},
                 }
             )
 
@@ -347,7 +368,7 @@ async def make_booking(data: BookingRequest):
             except Exception:
                 continue
 
-            if db_checkin < checkout_dt and db_checkout > checkin_dt:
+            if db_checkin < checkout_dt and db_checkout >= checkin_dt:
                 free = False
                 break
 
@@ -374,7 +395,7 @@ async def make_booking(data: BookingRequest):
         "check_out_date": data.check_out_date,
         "stay_days": stay_days,
         "user_name": data.user_name,
-        "email": data.email,
+        "email": data.email.lower(),
         "adults": data.adults,
         "children": data.children,
         "status": "confirmed",
@@ -395,7 +416,7 @@ async def get_bookings_by_email(email: str):
     """
 
     bookings = []
-    cursor = bookings_collection.find({"email": email})
+    cursor = bookings_collection.find({"email": email.lower()})
     async for item in cursor:
         item.pop("_id", None)
         bookings.append(Booking(**item))
@@ -436,12 +457,13 @@ mcp.mount_http()
 # ==================== LOGIN ====================
 @app.post("/login")
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    if form_data.username != DUMMY_USER["username"] or form_data.password != DUMMY_USER["password"]:
+    admin = await admins_collection.find_one({"username": form_data.username})
+    
+    if not admin or not verify_password(form_data.password, admin["password"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
-
+    
     token = create_token(form_data.username)
     return {"access_token": token, "token_type": "bearer"}
-
 
 @app.post("/room-types", response_model=RoomType)
 async def add_room(room_data: RoomType):

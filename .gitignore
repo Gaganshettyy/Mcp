@@ -2,3 +2,5 @@
 myenv/
 .env
 backup/
+script copy.js 
+script copy 2.js 

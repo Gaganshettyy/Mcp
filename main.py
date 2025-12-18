@@ -95,6 +95,7 @@ class BookingRequest(BaseModel):
     check_out_date: str
     user_name: str
     email: EmailStr
+    phone: Optional[str] = None
     adults: int
     children: int
 
@@ -109,6 +110,7 @@ class Booking(BaseModel):
     stay_days: int
     user_name: str
     email: str
+    phone: Optional[str] = None
     adults: int
     children: int
     status: str
@@ -149,7 +151,28 @@ def parse_date(date_str: str) -> datetime:
         return datetime.strptime(date_str, "%Y-%m-%d")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid date format, use YYYY-MM-DD")
+    
+def get_current_month_range_str():
+    now = datetime.utcnow()
 
+    start = datetime(now.year, now.month, 1)
+    if now.month == 12:
+        end = datetime(now.year + 1, 1, 1)
+    else:
+        end = datetime(now.year, now.month + 1, 1)
+
+    return start.isoformat(), end.isoformat()
+
+def get_current_month_range():
+    now = datetime.utcnow()
+    start = datetime(now.year, now.month, 1)
+
+    if now.month == 12:
+        end = datetime(now.year + 1, 1, 1)
+    else:
+        end = datetime(now.year, now.month + 1, 1)
+
+    return start, end
 
 async def is_room_type_available(
     room_data,
@@ -285,7 +308,6 @@ async def available_rooms(
 # ==================== BOOKINGS ====================
 @app.post("/bookings", response_model=BookingResponse)
 async def make_booking(data: BookingRequest):
-    # Basic log
     print("BOOKING REQUEST:", data.model_dump())
 
     # Parse dates
@@ -300,12 +322,14 @@ async def make_booking(data: BookingRequest):
 
     if checkin_dt.date() < today or checkout_dt.date() < today:
         raise HTTPException(status_code=400, detail="Dates cannot be in the past")
+
     if checkin_dt.date() > max_date or checkout_dt.date() > max_date:
         raise HTTPException(status_code=400, detail="Dates cannot be more than 30 days ahead")
+
     if checkout_dt <= checkin_dt:
         raise HTTPException(status_code=400, detail="check_out_date must be after check_in_date")
 
-    # Fetch room type once
+    # Fetch room type
     room_data = await room_types_collection.find_one({"id": data.room_type_id})
     if not room_data:
         raise HTTPException(status_code=404, detail="Room type not found")
@@ -319,11 +343,18 @@ async def make_booking(data: BookingRequest):
 
     # Capacity validation
     if data.adults > room_data["capacity"]["adults"]:
-        raise HTTPException(status_code=400, detail=f"Max adults allowed for this room: {room_data['capacity']['adults']}")
-    if data.children > room_data["capacity"]["children"]:
-        raise HTTPException(status_code=400, detail=f"Max children allowed for this room: {room_data['capacity']['children']}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max adults allowed: {room_data['capacity']['adults']}"
+        )
 
-    # Use is_room_type_available to check both capacity and date availability
+    if data.children > room_data["capacity"]["children"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Max children allowed: {room_data['capacity']['children']}"
+        )
+
+    # Check availability
     available = await is_room_type_available(
         room_data,
         checkin_dt,
@@ -332,9 +363,12 @@ async def make_booking(data: BookingRequest):
         data.children,
     )
     if not available:
-        raise HTTPException(status_code=400, detail="This room type is not available for the selected dates or capacity")
+        raise HTTPException(
+            status_code=400,
+            detail="This room type is not available for the selected dates or capacity"
+        )
 
-    # Select a free room_no
+    # Pick a free room number
     selected_room = None
     for rn in room_data.get("room_numbers", []):
         room_no = rn["room_no"]
@@ -345,13 +379,10 @@ async def make_booking(data: BookingRequest):
 
         free = True
         async for b in cursor:
-            try:
-                db_checkin = datetime.strptime(b["check_in_date"], "%Y-%m-%d")
-                db_checkout = datetime.strptime(b["check_out_date"], "%Y-%m-%d")
-            except Exception:
-                continue
+            db_checkin = datetime.strptime(b["check_in_date"], "%Y-%m-%d")
+            db_checkout = datetime.strptime(b["check_out_date"], "%Y-%m-%d")
 
-            if db_checkin < checkout_dt and db_checkout >= checkin_dt:
+            if db_checkin < checkout_dt and db_checkout > checkin_dt:
                 free = False
                 break
 
@@ -362,13 +393,14 @@ async def make_booking(data: BookingRequest):
     if not selected_room:
         raise HTTPException(status_code=400, detail="No rooms available")
 
-    # Create booking ID
+    # Generate booking ID
     last = await bookings_collection.find_one(sort=[("booking_id", -1)])
     new_id = 1 if not last else last["booking_id"] + 1
 
     night_price = room_data["pricing"]["total_price"]
     total_price = night_price * stay_days
 
+    # Build record
     record = {
         "booking_id": new_id,
         "room_type_id": room_data["id"],
@@ -379,6 +411,7 @@ async def make_booking(data: BookingRequest):
         "stay_days": stay_days,
         "user_name": data.user_name,
         "email": data.email.lower(),
+        "phone": data.phone,          # ✅ optional
         "adults": data.adults,
         "children": data.children,
         "status": "confirmed",
@@ -386,11 +419,19 @@ async def make_booking(data: BookingRequest):
         "total_price": total_price
     }
 
+    # Remove phone if not provided
+    if record["phone"] is None:
+        record.pop("phone")
+
     await bookings_collection.insert_one(record)
     record.pop("_id", None)
 
     print("BOOKING CREATED:", record["booking_id"], "ROOM_NO:", selected_room)
-    return {"message": "Room Booked Successfully!", "booking": Booking(**record)}
+
+    return {
+        "message": "Room Booked Successfully!",
+        "booking": Booking(**record)
+    }
 
 @app.get("/bookings/email/{email}", response_model=List[Booking])
 async def get_bookings_by_email(email: str):
@@ -457,14 +498,98 @@ async def add_room(room_data: RoomType):
 def root():
     return {"message": "Hotel Booking API Running 🏨"}
 
-@app.get("/room-types", response_model=List[RoomType])
-async def get_all_room_types():
+@app.get("/room-types")
+async def get_all_room_types(
+    page: int = Query(1, ge=1),
+    limit: int = Query(10, ge=1, le=50)
+):
+    skip = (page - 1) * limit
+
+    total = await room_types_collection.count_documents({})
+
+    cursor = (
+        room_types_collection
+        .find()
+        .skip(skip)
+        .limit(limit)
+    )
+
     rooms = []
-    cursor = room_types_collection.find()
     async for doc in cursor:
         doc.pop("_id", None)
-        rooms.append(RoomType(**doc))
-    return rooms
+        rooms.append(doc)
+
+    return {
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "total_pages": (total + limit - 1) // limit,
+        "data": rooms
+    }
+
+@app.get("/dashboard/stats")
+async def dashboard_stats():
+
+    start_date, end_date = get_current_month_range()
+
+    # ------------------------
+    # TOTAL ROOMS (ALL TIME)
+    # ------------------------
+    total_rooms = 0
+    cursor = room_types_collection.find()
+    async for room in cursor:
+        total_rooms += len(room.get("room_numbers", []))
+
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+
+    # ------------------------
+    # TOTAL BOOKINGS (MONTH - STAY BASED)
+    # ------------------------
+    total_bookings = await bookings_collection.count_documents({
+        "check_in_date": {"$lt": end_str},
+        "check_out_date": {"$gt": start_str}
+    })
+
+    # ------------------------
+    # CONFIRMED BOOKINGS (MONTH - STAY BASED)
+    # ------------------------
+    confirmed_bookings = await bookings_collection.count_documents({
+        "status": "confirmed",
+        "check_in_date": {"$lt": end_str},
+        "check_out_date": {"$gt": start_str}
+    })
+
+    # ------------------------
+    # REVENUE (MONTH - STAY BASED)
+    # ------------------------
+    pipeline = [
+        {
+            "$match": {
+                "status": "confirmed",
+                "check_in_date": {"$lt": end_str},
+                "check_out_date": {"$gt": start_str}
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "revenue": {"$sum": "$total_price"}
+            }
+        }
+    ]
+
+    result = await bookings_collection.aggregate(pipeline).to_list(1)
+    revenue = result[0]["revenue"] if result else 0
+
+    return {
+        "month": start_date.strftime("%B %Y"),
+        "total_rooms": total_rooms,
+        "total_bookings": total_bookings,
+        "confirmed_bookings": confirmed_bookings,
+        "revenue": revenue
+    }
+
 
 @app.post("/room-types", response_model=RoomType)
 async def create_room_type(room_data: RoomType):
